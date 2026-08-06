@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     LOG_FILE: str = Field(default="wikijs_mcp.log")
     REPOSITORY_ROOT: str = Field(default="./")
     DEFAULT_SPACE_NAME: str = Field(default="Documentation")
+    DEFAULT_LOCALE: str = Field(default="en")
     
     class Config:
         env_file = ".env"
@@ -261,21 +262,23 @@ def extract_code_structure(file_path: str) -> Dict[str, Any]:
 # MCP Tools Implementation
 
 @mcp.tool()
-async def wikijs_create_page(title: str, content: str, space_id: str = "", parent_id: str = "") -> str:
+async def wikijs_create_page(title: str, content: str, space_id: str = "", parent_id: str = "", locale: str = None) -> str:
     """
     Create a new page in Wiki.js with support for hierarchical organization.
     
     Args:
         title: Page title
         content: Page content (markdown or HTML)
-        space_id: Space ID (optional, uses default if not provided)
+        space_id: Space ID (optional, used as top-level path prefix, from list_spaces)
         parent_id: Parent page ID for hierarchical organization (optional)
+        locale: Page locale (optional, defaults to DEFAULT_LOCALE setting, e.g. "ru")
     
     Returns:
         JSON string with page details: {'pageId': int, 'url': str}
     """
     try:
         await wikijs.authenticate()
+        page_locale = locale or settings.DEFAULT_LOCALE
         
         # Generate path - if parent_id provided, create nested path
         if parent_id:
@@ -299,6 +302,9 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
                 path = f"{parent_path}/{slugify(title)}"
             else:
                 path = slugify(title)
+        elif space_id:
+            # Use space slug as top-level path prefix
+            path = f"{slugify(space_id)}/{slugify(title)}"
         else:
             path = slugify(title)
         
@@ -329,7 +335,7 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
             "editor": "markdown",
             "isPublished": True,
             "isPrivate": False,
-            "locale": "en",
+            "locale": page_locale,
             "path": path,
             "publishEndDate": None,
             "publishStartDate": None,
@@ -366,7 +372,7 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_update_page(page_id: int, title: str = None, content: str = None) -> str:
+async def wikijs_update_page(page_id: int, title: str = None, content: str = None, locale: str = None) -> str:
     """
     Update an existing page in Wiki.js.
     
@@ -374,6 +380,7 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
         page_id: Page ID to update
         title: New title (optional)
         content: New content (optional)
+        locale: New locale (optional, keeps current if not provided)
     
     Returns:
         JSON string with update status
@@ -433,6 +440,7 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
         # Use provided values or keep current ones
         new_title = title if title is not None else current_page["title"]
         new_content = content if content is not None else current_page["content"]
+        new_locale = locale if locale is not None else current_page.get("locale", settings.DEFAULT_LOCALE)
         
         variables = {
             "id": page_id,
@@ -441,7 +449,7 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
             "editor": "markdown",
             "isPrivate": current_page.get("isPrivate", False),
             "isPublished": current_page.get("isPublished", True),
-            "locale": current_page.get("locale", "en"),
+            "locale": new_locale,
             "path": current_page["path"],
             "scriptCss": "",
             "scriptJs": "",
@@ -474,19 +482,21 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_get_page(page_id: int = None, slug: str = None) -> str:
+async def wikijs_get_page(page_id: int = None, slug: str = None, locale: str = None) -> str:
     """
     Retrieve page metadata and content from Wiki.js.
     
     Args:
         page_id: Page ID (optional)
         slug: Page slug/path (optional)
+        locale: Page locale for slug lookup (optional, defaults to DEFAULT_LOCALE, e.g. "ru")
     
     Returns:
         JSON string with page data
     """
     try:
         await wikijs.authenticate()
+        page_locale = locale or settings.DEFAULT_LOCALE
         
         if page_id:
             query = """
@@ -513,9 +523,9 @@ async def wikijs_get_page(page_id: int = None, slug: str = None) -> str:
             variables = {"id": page_id}
         elif slug:
             query = """
-            query($path: String!) {
+            query($path: String!, $locale: String!) {
                 pages {
-                    singleByPath(path: $path, locale: "en") {
+                    singleByPath(path: $path, locale: $locale) {
                         id
                         path
                         title
@@ -533,7 +543,7 @@ async def wikijs_get_page(page_id: int = None, slug: str = None) -> str:
                 }
             }
             """
-            variables = {"path": slug}
+            variables = {"path": slug, "locale": page_locale}
         else:
             return json.dumps({"error": "Either page_id or slug must be provided"})
         
@@ -568,25 +578,27 @@ async def wikijs_get_page(page_id: int = None, slug: str = None) -> str:
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_search_pages(query: str, space_id: str = None) -> str:
+async def wikijs_search_pages(query: str, space_id: str = None, locale: str = None) -> str:
     """
     Search pages by text in Wiki.js.
     
     Args:
         query: Search query
         space_id: Space ID to limit search (optional)
+        locale: Search locale (optional, defaults to DEFAULT_LOCALE, e.g. "ru")
     
     Returns:
         JSON string with search results
     """
     try:
         await wikijs.authenticate()
+        page_locale = locale or settings.DEFAULT_LOCALE
         
         # GraphQL query for search (fixed - removed invalid suggestions subfields)
         search_query = """
-        query($query: String!) {
+        query($query: String!, $locale: String!) {
             pages {
-                search(query: $query, path: "", locale: "en") {
+                search(query: $query, path: "", locale: $locale) {
                     results {
                         id
                         title
@@ -600,7 +612,7 @@ async def wikijs_search_pages(query: str, space_id: str = None) -> str:
         }
         """
         
-        variables = {"query": query}
+        variables = {"query": query, "locale": page_locale}
         
         response = await wikijs.graphql_request(search_query, variables)
         
@@ -666,7 +678,7 @@ async def wikijs_list_spaces() -> str:
                 top_level = path_parts[0] if path_parts[0] else "root"
                 if top_level not in spaces:
                     spaces[top_level] = {
-                        "spaceId": hash(top_level) % 10000,  # Generate pseudo ID
+                        "spaceId": top_level,  # Stable, deterministic: the top-level path slug itself
                         "name": top_level.replace("-", " ").title(),
                         "slug": top_level,
                         "description": f"Pages under /{top_level}",
@@ -682,7 +694,7 @@ async def wikijs_list_spaces() -> str:
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_create_space(name: str, description: str = None) -> str:
+async def wikijs_create_space(name: str, description: str = None, locale: str = None) -> str:
     """
     Create a new space in Wiki.js.
     Note: Wiki.js doesn't have spaces, so this creates a root-level page as a space placeholder.
@@ -690,6 +702,7 @@ async def wikijs_create_space(name: str, description: str = None) -> str:
     Args:
         name: Space name
         description: Space description (optional)
+        locale: Page locale (optional, defaults to DEFAULT_LOCALE, e.g. "ru")
     
     Returns:
         JSON string with space details
@@ -698,7 +711,7 @@ async def wikijs_create_space(name: str, description: str = None) -> str:
         # Create a root page that acts as a space
         space_content = f"# {name}\n\n{description or 'This is the main page for the ' + name + ' section.'}\n\n## Pages in this section:\n\n*Pages will be listed here as they are created.*"
         
-        result = await wikijs_create_page(name, space_content)
+        result = await wikijs_create_page(name, space_content, locale=locale)
         result_data = json.loads(result)
         
         if "error" not in result_data:
@@ -1134,7 +1147,7 @@ async def wikijs_repository_context() -> str:
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_create_repo_structure(repo_name: str, description: str = None, sections: List[str] = None) -> str:
+async def wikijs_create_repo_structure(repo_name: str, description: str = None, sections: List[str] = None, locale: str = None) -> str:
     """
     Create a complete repository documentation structure with nested pages.
     
@@ -1142,6 +1155,7 @@ async def wikijs_create_repo_structure(repo_name: str, description: str = None, 
         repo_name: Repository name (will be the root page)
         description: Repository description
         sections: List of main sections to create (e.g., ["Overview", "API", "Components", "Deployment"])
+        locale: Page locale (optional, defaults to DEFAULT_LOCALE, e.g. "ru")
     
     Returns:
         JSON string with created structure details
@@ -1178,7 +1192,7 @@ This documentation is organized into the following sections:
 """
         
         # Create root page
-        root_result = await wikijs_create_page(repo_name, root_content)
+        root_result = await wikijs_create_page(repo_name, root_content, locale=locale)
         root_data = json.loads(root_result)
         
         if "error" in root_data:
@@ -1205,7 +1219,7 @@ This is the {section.lower()} section for {repo_name}.
 *This page is part of the {repo_name} documentation structure.*
 """
             
-            section_result = await wikijs_create_page(section, section_content, parent_id=str(root_page_id))
+            section_result = await wikijs_create_page(section, section_content, parent_id=str(root_page_id), locale=locale)
             section_data = json.loads(section_result)
             
             if "error" not in section_data:
@@ -1231,7 +1245,7 @@ This is the {section.lower()} section for {repo_name}.
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_create_nested_page(title: str, content: str, parent_path: str, create_parent_if_missing: bool = True) -> str:
+async def wikijs_create_nested_page(title: str, content: str, parent_path: str, create_parent_if_missing: bool = True, locale: str = None) -> str:
     """
     Create a nested page using hierarchical paths (e.g., "repo/api/endpoints").
     
@@ -1240,18 +1254,20 @@ async def wikijs_create_nested_page(title: str, content: str, parent_path: str, 
         content: Page content
         parent_path: Full path to parent (e.g., "my-repo/api")
         create_parent_if_missing: Create parent pages if they don't exist
+        locale: Page locale (optional, defaults to DEFAULT_LOCALE, e.g. "ru")
     
     Returns:
         JSON string with page details
     """
     try:
         await wikijs.authenticate()
+        page_locale = locale or settings.DEFAULT_LOCALE
         
         # Check if parent exists
         parent_query = """
-        query($path: String!) {
+        query($path: String!, $locale: String!) {
             pages {
-                singleByPath(path: $path, locale: "en") {
+                singleByPath(path: $path, locale: $locale) {
                     id
                     path
                     title
@@ -1260,7 +1276,7 @@ async def wikijs_create_nested_page(title: str, content: str, parent_path: str, 
         }
         """
         
-        parent_response = await wikijs.graphql_request(parent_query, {"path": parent_path})
+        parent_response = await wikijs.graphql_request(parent_query, {"path": parent_path, "locale": page_locale})
         parent_data = parent_response.get("data", {}).get("pages", {}).get("singleByPath")
         
         if not parent_data and create_parent_if_missing:
@@ -1276,7 +1292,7 @@ async def wikijs_create_nested_page(title: str, content: str, parent_path: str, 
                     current_path = part
                 
                 # Check if this level exists
-                check_response = await wikijs.graphql_request(parent_query, {"path": current_path})
+                check_response = await wikijs.graphql_request(parent_query, {"path": current_path, "locale": page_locale})
                 existing = check_response.get("data", {}).get("pages", {}).get("singleByPath")
                 
                 if not existing:
@@ -1294,7 +1310,7 @@ This is a section page for organizing documentation.
 *This page was auto-created as part of the documentation hierarchy.*
 """
                     
-                    create_result = await wikijs_create_page(part_title, part_content, parent_id=str(parent_id) if parent_id else "")
+                    create_result = await wikijs_create_page(part_title, part_content, parent_id=str(parent_id) if parent_id else "", locale=page_locale)
                     create_data = json.loads(create_result)
                     
                     if "error" not in create_data:
@@ -1310,7 +1326,7 @@ This is a section page for organizing documentation.
             return json.dumps({"error": f"Parent path '{parent_path}' not found and create_parent_if_missing is False"})
         
         # Create the target page
-        result = await wikijs_create_page(title, content, parent_id=str(parent_id))
+        result = await wikijs_create_page(title, content, parent_id=str(parent_id), locale=page_locale)
         result_data = json.loads(result)
         
         if "error" not in result_data:
@@ -1325,19 +1341,21 @@ This is a section page for organizing documentation.
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_get_page_children(page_id: int = None, page_path: str = None) -> str:
+async def wikijs_get_page_children(page_id: int = None, page_path: str = None, locale: str = None) -> str:
     """
     Get all child pages of a given page for hierarchical navigation.
     
     Args:
         page_id: Parent page ID (optional)
         page_path: Parent page path (optional)
+        locale: Page locale for path lookup (optional, defaults to DEFAULT_LOCALE, e.g. "ru")
     
     Returns:
         JSON string with child pages list
     """
     try:
         await wikijs.authenticate()
+        page_locale = locale or settings.DEFAULT_LOCALE
         
         # Get the parent page first
         if page_id:
@@ -1356,9 +1374,9 @@ async def wikijs_get_page_children(page_id: int = None, page_path: str = None) -
             parent_data = parent_response.get("data", {}).get("pages", {}).get("single")
         elif page_path:
             parent_query = """
-            query($path: String!) {
+            query($path: String!, $locale: String!) {
                 pages {
-                    singleByPath(path: $path, locale: "en") {
+                    singleByPath(path: $path, locale: $locale) {
                         id
                         path
                         title
@@ -1366,7 +1384,7 @@ async def wikijs_get_page_children(page_id: int = None, page_path: str = None) -
                 }
             }
             """
-            parent_response = await wikijs.graphql_request(parent_query, {"path": page_path})
+            parent_response = await wikijs.graphql_request(parent_query, {"path": page_path, "locale": page_locale})
             parent_data = parent_response.get("data", {}).get("pages", {}).get("singleByPath")
         else:
             return json.dumps({"error": "Either page_id or page_path must be provided"})
@@ -1430,7 +1448,7 @@ async def wikijs_get_page_children(page_id: int = None, page_path: str = None) -
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_create_documentation_hierarchy(project_name: str, file_mappings: List[Dict[str, str]], auto_organize: bool = True) -> str:
+async def wikijs_create_documentation_hierarchy(project_name: str, file_mappings: List[Dict[str, str]], auto_organize: bool = True, locale: str = None) -> str:
     """
     Create a complete documentation hierarchy for a project based on file structure.
     
@@ -1438,6 +1456,7 @@ async def wikijs_create_documentation_hierarchy(project_name: str, file_mappings
         project_name: Name of the project/repository
         file_mappings: List of {"file_path": "src/components/Button.tsx", "doc_path": "components/button"} mappings
         auto_organize: Automatically organize files into logical sections
+        locale: Page locale (optional, defaults to DEFAULT_LOCALE, e.g. "ru")
     
     Returns:
         JSON string with created hierarchy details
@@ -1479,7 +1498,7 @@ async def wikijs_create_documentation_hierarchy(project_name: str, file_mappings
         # Create root project structure
         section_names = [name.title() for name, files in sections.items() if files] if auto_organize else ["Documentation"]
         
-        repo_result = await wikijs_create_repo_structure(project_name, f"Documentation for {project_name}", section_names)
+        repo_result = await wikijs_create_repo_structure(project_name, f"Documentation for {project_name}", section_names, locale=locale)
         repo_data = json.loads(repo_result)
         
         if "error" in repo_data:
@@ -1523,7 +1542,8 @@ async def wikijs_create_documentation_hierarchy(project_name: str, file_mappings
                 nested_result = await wikijs_create_nested_page(
                     os.path.basename(file_path),
                     f"# {os.path.basename(file_path)}\n\nDocumentation for {file_path}",
-                    doc_path
+                    doc_path,
+                    locale=locale
                 )
                 nested_data = json.loads(nested_result)
                 
@@ -1558,7 +1578,7 @@ async def wikijs_create_documentation_hierarchy(project_name: str, file_mappings
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_file_mapping: bool = True) -> str:
+async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_file_mapping: bool = True, locale: str = None) -> str:
     """
     Delete a specific page from Wiki.js.
     
@@ -1566,12 +1586,14 @@ async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_
         page_id: Page ID to delete (optional)
         page_path: Page path to delete (optional)
         remove_file_mapping: Also remove file-to-page mapping from local database
+        locale: Page locale for path lookup (optional, defaults to DEFAULT_LOCALE, e.g. "ru")
     
     Returns:
         JSON string with deletion status
     """
     try:
         await wikijs.authenticate()
+        page_locale = locale or settings.DEFAULT_LOCALE
         
         # Get page info first
         if page_id:
@@ -1590,9 +1612,9 @@ async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_
             page_data = get_response.get("data", {}).get("pages", {}).get("single")
         elif page_path:
             get_query = """
-            query($path: String!) {
+            query($path: String!, $locale: String!) {
                 pages {
-                    singleByPath(path: $path, locale: "en") {
+                    singleByPath(path: $path, locale: $locale) {
                         id
                         path
                         title
@@ -1600,7 +1622,7 @@ async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_
                 }
             }
             """
-            get_response = await wikijs.graphql_request(get_query, {"path": page_path})
+            get_response = await wikijs.graphql_request(get_query, {"path": page_path, "locale": page_locale})
             page_data = get_response.get("data", {}).get("pages", {}).get("singleByPath")
             if page_data:
                 page_id = page_data["id"]
@@ -1668,7 +1690,8 @@ async def wikijs_batch_delete_pages(
     page_paths: List[str] = None,
     path_pattern: str = None,
     confirm_deletion: bool = False,
-    remove_file_mappings: bool = True
+    remove_file_mappings: bool = True,
+    locale: str = None
 ) -> str:
     """
     Batch delete multiple pages from Wiki.js.
@@ -1679,6 +1702,7 @@ async def wikijs_batch_delete_pages(
         path_pattern: Pattern to match paths (e.g., "frontend-app/*" for all pages under frontend-app)
         confirm_deletion: Must be True to actually delete pages (safety check)
         remove_file_mappings: Also remove file-to-page mappings from local database
+        locale: Page locale for path lookup (optional, defaults to DEFAULT_LOCALE, e.g. "ru")
     
     Returns:
         JSON string with batch deletion results
@@ -1691,6 +1715,7 @@ async def wikijs_batch_delete_pages(
             })
         
         await wikijs.authenticate()
+        page_locale = locale or settings.DEFAULT_LOCALE
         
         pages_to_delete = []
         
@@ -1717,9 +1742,9 @@ async def wikijs_batch_delete_pages(
         if page_paths:
             for page_path in page_paths:
                 get_query = """
-                query($path: String!) {
+                query($path: String!, $locale: String!) {
                     pages {
-                        singleByPath(path: $path, locale: "en") {
+                        singleByPath(path: $path, locale: $locale) {
                             id
                             path
                             title
@@ -1727,7 +1752,7 @@ async def wikijs_batch_delete_pages(
                     }
                 }
                 """
-                get_response = await wikijs.graphql_request(get_query, {"path": page_path})
+                get_response = await wikijs.graphql_request(get_query, {"path": page_path, "locale": page_locale})
                 page_data = get_response.get("data", {}).get("pages", {}).get("singleByPath")
                 if page_data:
                     pages_to_delete.append(page_data)
