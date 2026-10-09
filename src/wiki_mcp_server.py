@@ -148,12 +148,21 @@ class WikiJSClient:
                 return False
         return False
     
+    async def graphql_request(self, query: str, variables: Optional[Dict] = None) -> Dict:
+        # Only reads are safe to retry after a lost response.
+        if query.lstrip().startswith(("query", "{")):
+            return await self._graphql_read(query, variables)
+        return await self._graphql_request(query, variables)
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    async def graphql_request(self, query: str, variables: Dict = None) -> Dict:
+    async def _graphql_read(self, query: str, variables: Optional[Dict] = None) -> Dict:
+        return await self._graphql_request(query, variables)
+
+    async def _graphql_request(self, query: str, variables: Optional[Dict] = None) -> Dict:
         """Make GraphQL request to Wiki.js."""
         url = f"{self.base_url}/graphql"
         
-        payload = {"query": query}
+        payload: Dict[str, Any] = {"query": query}
         if variables:
             payload["variables"] = variables
         
@@ -372,19 +381,37 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_update_page(page_id: int, title: str = None, content: str = None, locale: str = None) -> str:
+async def wikijs_update_page(
+    page_id: int,
+    title: Optional[str] = None,
+    content: Optional[str] = None,
+    locale: Optional[str] = None,
+    description: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    is_published: Optional[bool] = None,
+) -> str:
     """
     Update an existing page in Wiki.js.
     
     Args:
         page_id: Page ID to update
-        title: New title (optional)
-        content: New content (optional)
-        locale: New locale (optional, keeps current if not provided)
+        title: New title (omitted or empty keeps current)
+        content: New content (omitted or empty keeps current)
+        locale: New locale (omitted or empty keeps current)
+        description: New description (None keeps current; empty clears)
+        tags: Replacement tags (None keeps current; [] clears)
+        is_published: Publication state (None keeps current)
     
     Returns:
         JSON string with update status
     """
+    return await _update_page(page_id, title, content, locale, description, tags, is_published)
+
+async def _update_page(
+    page_id, title=None, content=None, locale=None, description=None,
+    tags=None, is_published=None, tags_action="replace",
+    old_string=None, new_string=None, replace_all=False,
+):
     try:
         await wikijs.authenticate()
         
@@ -397,10 +424,16 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
                     path
                     title
                     content
+                    updatedAt
                     description
                     isPrivate
                     isPublished
                     locale
+                    editor
+                    publishStartDate
+                    publishEndDate
+                    scriptCss
+                    scriptJs
                     tags {
                         tag
                     }
@@ -417,9 +450,9 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
         
         # GraphQL mutation to update a page
         mutation = """
-        mutation($id: Int!, $content: String!, $description: String!, $editor: String!, $isPrivate: Boolean!, $isPublished: Boolean!, $locale: String!, $path: String!, $scriptCss: String, $scriptJs: String, $tags: [String]!, $title: String!) {
+        mutation($id: Int!, $content: String!, $description: String!, $editor: String!, $isPrivate: Boolean!, $isPublished: Boolean!, $locale: String!, $path: String!, $publishStartDate: Date, $publishEndDate: Date, $scriptCss: String, $scriptJs: String, $tags: [String]!, $title: String!) {
             pages {
-                update(id: $id, content: $content, description: $description, editor: $editor, isPrivate: $isPrivate, isPublished: $isPublished, locale: $locale, path: $path, scriptCss: $scriptCss, scriptJs: $scriptJs, tags: $tags, title: $title) {
+                update(id: $id, content: $content, description: $description, editor: $editor, isPrivate: $isPrivate, isPublished: $isPublished, locale: $locale, path: $path, publishStartDate: $publishStartDate, publishEndDate: $publishEndDate, scriptCss: $scriptCss, scriptJs: $scriptJs, tags: $tags, title: $title) {
                     responseResult {
                         succeeded
                         errorCode
@@ -438,22 +471,42 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
         """
         
         # Use provided values or keep current ones
-        new_title = title if title is not None else current_page["title"]
-        new_content = content if content is not None else current_page["content"]
-        new_locale = locale if locale is not None else current_page.get("locale", settings.DEFAULT_LOCALE)
+        new_title = title or current_page["title"]
+        new_content = content or current_page["content"]
+        replacements = None
+        if old_string is not None:
+            matches = current_page["content"].count(old_string)
+            if not matches:
+                return json.dumps({"error": "old_string not found; no edit performed"})
+            if matches > 1 and not replace_all:
+                return json.dumps({"error": "old_string is ambiguous; provide more context or replace_all=True", "matches": matches})
+            new_content = current_page["content"].replace(old_string, new_string)
+            if new_content == current_page["content"]:
+                return json.dumps({"pageId": page_id, "path": current_page["path"], "lastModified": current_page.get("updatedAt"), "status": "unchanged", "replacements": 0})
+            if not new_content.strip():
+                return json.dumps({"error": "Wiki.js requires a nonempty page body; no edit performed"})
+            replacements = matches
+        new_locale = locale or current_page["locale"]
+        current_tags = [tag["tag"] for tag in current_page["tags"]]
+        if tags_action == "add":
+            tags = list(dict.fromkeys(current_tags + tags))
+        elif tags_action == "remove":
+            tags = [tag for tag in current_tags if tag not in tags]
         
         variables = {
             "id": page_id,
             "content": new_content,
-            "description": current_page.get("description", ""),
-            "editor": "markdown",
-            "isPrivate": current_page.get("isPrivate", False),
-            "isPublished": current_page.get("isPublished", True),
+            "description": current_page["description"] if description is None else description,
+            "editor": current_page["editor"],
+            "isPrivate": current_page["isPrivate"],
+            "isPublished": current_page["isPublished"] if is_published is None else is_published,
             "locale": new_locale,
             "path": current_page["path"],
-            "scriptCss": "",
-            "scriptJs": "",
-            "tags": [tag["tag"] for tag in current_page.get("tags", [])],
+            "publishStartDate": current_page["publishStartDate"],
+            "publishEndDate": current_page["publishEndDate"],
+            "scriptCss": current_page["scriptCss"],
+            "scriptJs": current_page["scriptJs"],
+            "tags": current_tags if tags is None else list(dict.fromkeys(tags)),
             "title": new_title
         }
         
@@ -468,9 +521,13 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
                 "pageId": page_id,
                 "status": "updated",
                 "title": page_data.get("title"),
+                "tags": variables["tags"],
                 "lastModified": page_data.get("updatedAt")
             }
             logger.info(f"Updated page ID: {page_id}")
+            if replacements is not None:
+                result["replacements"] = replacements
+                result["path"] = current_page["path"]
             return json.dumps(result)
         else:
             error_msg = response_result.get("message", "Unknown error")
@@ -480,6 +537,246 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
         error_msg = f"Failed to update page {page_id}: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
+@mcp.tool()
+async def wikijs_move_page(page_id: int, destination_path: str, destination_locale: Optional[str] = None) -> str:
+    """Move a page natively, retaining its ID/history. Verify by ID; never retry mutations.
+
+    destination_locale defaults to the page's current locale. On an ambiguous
+    outcome inspect the returned verification before explicitly trying again.
+    """
+    move_attempted = False
+    try:
+        if not destination_path or destination_path != destination_path.strip("/"):
+            return json.dumps({"error": "destination_path must be nonempty without leading/trailing slashes"})
+        await wikijs.authenticate()
+        query = "query($id: Int!) { pages { single(id: $id) { id path locale } } }"
+        response = await wikijs.graphql_request(query, {"id": page_id})
+        current = response.get("data", {}).get("pages", {}).get("single")
+        if not current:
+            return json.dumps({"error": f"Page with ID {page_id} not found"})
+        target_locale = destination_locale or current["locale"]
+        if current["path"] == destination_path and current["locale"] == target_locale:
+            return json.dumps({"pageId": page_id, "path": destination_path, "locale": target_locale, "status": "unchanged", "verified": True})
+        mutation = """
+        mutation($id: Int!, $destinationPath: String!, $destinationLocale: String!) {
+            pages {
+                move(id: $id, destinationPath: $destinationPath, destinationLocale: $destinationLocale) {
+                    responseResult { succeeded errorCode message }
+                }
+            }
+        }
+        """
+        failure = None
+        try:
+            move_attempted = True
+            response = await wikijs.graphql_request(mutation, {
+                "id": page_id, "destinationPath": destination_path, "destinationLocale": target_locale
+            })
+            result = response.get("data", {}).get("pages", {}).get("move", {}).get("responseResult", {})
+            if not result.get("succeeded"):
+                failure = result.get("message", "Move did not report success")
+        except Exception:
+            failure = "Move response unavailable; outcome may be ambiguous"
+        try:
+            response = await wikijs.graphql_request(query, {"id": page_id})
+            actual = response.get("data", {}).get("pages", {}).get("single")
+        except Exception:
+            return json.dumps({"pageId": page_id, "error": failure or "Move verification unavailable", "verified": False, "status": "unknown", "retrySafe": False})
+        if actual and actual["id"] == page_id and actual["path"] == destination_path and actual["locale"] == target_locale:
+            return json.dumps({"pageId": page_id, "path": actual["path"], "locale": actual["locale"], "status": "moved", "verified": True})
+        return json.dumps({"pageId": page_id, "error": failure or "Move destination verification failed", "status": "unconfirmed", "verified": False, "actual": actual, "retrySafe": False})
+    except Exception:
+        if move_attempted:
+            return json.dumps({"pageId": page_id, "error": "Move verification failed; outcome may be ambiguous", "status": "unknown", "verified": False, "retrySafe": False})
+        return json.dumps({"error": "Failed to inspect page before move; no move attempted"})
+
+@mcp.tool()
+async def wikijs_list_pages(locale: Optional[str] = None, path_prefix: str = "", limit: int = 100, offset: int = 0) -> str:
+    """List metadata/tags without content. None/empty locale means all locales.
+
+    path_prefix is a literal starts-with filter. limit is 1..500; offset is
+    applied after filtering. Wiki.js has no path/offset list arguments, so
+    filtering/pagination happen locally on the metadata-only list.
+    """
+    try:
+        if not 1 <= limit <= 500 or offset < 0:
+            return json.dumps({"error": "limit must be 1..500 and offset must be nonnegative"})
+        await wikijs.authenticate()
+        query = """
+        query($locale: String) {
+            pages {
+                list(locale: $locale, orderBy: ID, orderByDirection: ASC) {
+                    id path locale title description contentType isPublished isPrivate
+                    createdAt updatedAt tags
+                }
+            }
+        }
+        """
+        response = await wikijs.graphql_request(query, {"locale": locale or None})
+        pages = [page for page in response["data"]["pages"]["list"]
+                 if (not locale or page["locale"] == locale) and page["path"].startswith(path_prefix)]
+        return json.dumps({"pages": pages[offset:offset + limit], "total": len(pages), "offset": offset, "limit": limit, "hasMore": offset + limit < len(pages)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to list pages: {str(e)}"})
+
+@mcp.tool()
+async def wikijs_get_page_tags(page_id: int) -> str:
+    """Get a page's tags without fetching its content."""
+    try:
+        await wikijs.authenticate()
+        response = await wikijs.graphql_request(
+            "query($id: Int!) { pages { single(id: $id) { id tags { id tag title } } } }",
+            {"id": page_id})
+        page = response.get("data", {}).get("pages", {}).get("single")
+        if not page:
+            return json.dumps({"error": f"Page with ID {page_id} not found"})
+        return json.dumps({"pageId": page_id, "tags": page["tags"]})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to get page tags: {str(e)}"})
+
+@mcp.tool()
+async def wikijs_list_tags(limit: int = 100, offset: int = 0) -> str:
+    """List the native pages.tags catalog (limit 1..500, nonnegative offset)."""
+    try:
+        if not 1 <= limit <= 500 or offset < 0:
+            return json.dumps({"error": "limit must be 1..500 and offset must be nonnegative"})
+        await wikijs.authenticate()
+        response = await wikijs.graphql_request("query { pages { tags { id tag title } } }")
+        tags = sorted(response["data"]["pages"]["tags"], key=lambda tag: (tag["tag"], tag["id"]))
+        return json.dumps({"tags": tags[offset:offset + limit], "total": len(tags), "hasMore": offset + limit < len(tags)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to list tags: {str(e)}"})
+
+@mcp.tool()
+async def wikijs_add_page_tags(page_id: int, tags: List[str]) -> str:
+    """Add tags while retaining unrelated tags and all stored page metadata."""
+    return await _update_page(page_id, tags=tags, tags_action="add")
+
+@mcp.tool()
+async def wikijs_remove_page_tags(page_id: int, tags: List[str]) -> str:
+    """Remove only specified tags while retaining all stored page metadata."""
+    return await _update_page(page_id, tags=tags, tags_action="remove")
+
+@mcp.tool()
+async def wikijs_replace_page_tags(page_id: int, tags: List[str]) -> str:
+    """Replace the complete tag set ([] clears it), retaining other metadata."""
+    return await _update_page(page_id, tags=tags)
+
+@mcp.tool()
+async def wikijs_read_page(page_id: int, offset: int = 1, limit: int = 2000) -> str:
+    """Read numbered source lines (1-based), retaining Markdown or HTML as stored.
+
+    limit is 1..2000; offset must be positive. Lines are capped at 2000
+    characters and numbered output at 64000 characters. nextOffset continues
+    the read; lineTruncated signals clipped lines (not recoverable by offset).
+    """
+    try:
+        if offset < 1 or not 1 <= limit <= 2000:
+            return json.dumps({"error": "offset must be positive and limit must be 1..2000"})
+        await wikijs.authenticate()
+        response = await wikijs.graphql_request(
+            "query($id: Int!) { pages { single(id: $id) { id path title locale updatedAt contentType content } } }",
+            {"id": page_id})
+        page = response.get("data", {}).get("pages", {}).get("single")
+        if not page:
+            return json.dumps({"error": f"Page with ID {page_id} not found"})
+        lines = page["content"].splitlines()
+        output = []
+        size = 0
+        line_truncated = False
+        for number, line in enumerate(lines[offset - 1:offset - 1 + limit], offset):
+            numbered = f"{number}: {line[:2000]}"
+            if size + len(numbered) + bool(output) > 64000:
+                break
+            output.append(numbered)
+            size += len(numbered) + (len(output) > 1)
+            line_truncated = line_truncated or len(line) > 2000
+        has_more = offset - 1 + len(output) < len(lines)
+        return json.dumps({
+            "pageId": page["id"], "path": page["path"], "title": page["title"],
+            "locale": page["locale"], "lastModified": page["updatedAt"],
+            "contentType": page["contentType"], "content": "\n".join(output),
+            "offset": offset, "totalLines": len(lines), "hasMore": has_more,
+            "nextOffset": offset + len(output) if has_more else None,
+            "lineTruncated": line_truncated, "truncated": has_more or line_truncated,
+        })
+    except Exception as e:
+        return json.dumps({"error": f"Failed to read page: {str(e)}"})
+
+@mcp.tool()
+async def wikijs_edit_page(page_id: int, old_string: str, new_string: str, replace_all: bool = False) -> str:
+    """Replace exact source text, preserving metadata/tags. No fuzzy matching.
+
+    old_string must be nonempty and unique unless replace_all=True. Identical
+    replacements do not mutate. new_string may be empty, but Wiki.js rejects
+    empty/whitespace-only resulting bodies. Concurrent edits are not atomic;
+    mutations are never retried.
+    """
+    if not old_string:
+        return json.dumps({"error": "old_string must be nonempty"})
+    return await _update_page(page_id, old_string=old_string, new_string=new_string, replace_all=replace_all)
+
+@mcp.tool()
+async def wikijs_grep_pages(pattern: str, locale: Optional[str] = None, path_prefix: str = "", limit: int = 100, case_sensitive: bool = True) -> str:
+    """Search source per line using Python regex, returning only matching lines.
+
+    limit is 1..500 matching lines. Scan at most the first 100 candidates by ID
+    after locale/prefix filtering. Skip sources above 1000000 characters, clip
+    returned lines at 2000 characters, and report incomplete results. Python
+    regex has no execution timeout; use trusted patterns. No multiline matches.
+    """
+    try:
+        if not 1 <= limit <= 500:
+            return json.dumps({"error": "limit must be 1..500"})
+        try:
+            regex = re.compile(pattern, 0 if case_sensitive else re.IGNORECASE)
+        except re.error as e:
+            return json.dumps({"error": f"Invalid regex: {str(e)}"})
+        candidates = json.loads(await wikijs_list_pages(locale=locale, path_prefix=path_prefix, limit=100))
+        if "error" in candidates:
+            return json.dumps(candidates)
+        matches = []
+        skipped = []
+        scanned = 0
+        truncated = candidates["hasMore"]
+        result_limit_reached = False
+        line_truncated = False
+        query = "query($id: Int!) { pages { single(id: $id) { id path locale content } } }"
+        for candidate in candidates["pages"]:
+            scanned += 1
+            try:
+                response = await wikijs.graphql_request(query, {"id": candidate["id"]})
+                page = response.get("data", {}).get("pages", {}).get("single")
+                if not page:
+                    raise ValueError("Page unavailable")
+                # Recheck scope in case a candidate moved since the metadata read.
+                if (locale and page["locale"] != locale) or not page["path"].startswith(path_prefix):
+                    raise ValueError("Page moved outside filters")
+                if len(page["content"]) > 1000000:
+                    raise ValueError("Source exceeds 1000000 characters")
+            except Exception:
+                skipped.append(candidate["id"])
+                truncated = True
+                continue
+            for number, line in enumerate(page["content"].splitlines(), 1):
+                if regex.search(line):
+                    if len(matches) == limit:
+                        result_limit_reached = True
+                        break
+                    clipped = len(line) > 2000
+                    line_truncated = line_truncated or clipped
+                    matches.append({"pageId": page["id"], "path": page["path"], "locale": page["locale"],
+                                    "lineNumber": number, "line": line[:2000], "lineTruncated": clipped})
+            if result_limit_reached:
+                break
+        return json.dumps({"matches": matches, "pagesScanned": scanned,
+                           "candidatePages": candidates["total"], "skippedPageIds": skipped,
+                           "truncated": truncated or result_limit_reached or line_truncated,
+                           "resultLimitReached": result_limit_reached, "lineTruncated": line_truncated,
+                           "pageLimit": 100, "limit": limit})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to grep pages: {str(e)}"})
 
 @mcp.tool()
 async def wikijs_get_page(page_id: int = None, slug: str = None, locale: str = None) -> str:
@@ -580,7 +877,9 @@ async def wikijs_get_page(page_id: int = None, slug: str = None, locale: str = N
 @mcp.tool()
 async def wikijs_search_pages(query: str, space_id: str = None, locale: str = None) -> str:
     """
-    Search pages by text in Wiki.js.
+    Search using the native Wiki.js backend; not necessarily page content.
+    The database backend searches title, description and path only. Use
+    wikijs_grep_pages for bounded source-content regex search.
     
     Args:
         query: Search query
@@ -2083,4 +2382,4 @@ def main():
     mcp.run()
 
 if __name__ == "__main__":
-    main() 
+    main()
