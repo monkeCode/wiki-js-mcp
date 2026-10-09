@@ -121,7 +121,98 @@ These rules ensure that your AI assistant will:
 - **Search integration**: Full-text search across hierarchical content
 - **Health monitoring**: Connection status and error handling
 
-## 📊 MCP Tools (21 Total)
+## Safe Page Management
+
+- `wikijs_move_page(page_id, destination_path, destination_locale=None)` uses
+  native `pages.move`, preserving the page ID and history. The locale defaults
+  to the current page locale. Destination paths omit leading/trailing slashes.
+  It verifies the destination by ID, even after a lost mutation response.
+  Mutations are never automatically retried. If verification is unavailable or
+  mismatched, inspect the page by ID before explicitly trying again; a repeated
+  call checks the destination first and does not mutate an already-moved page.
+- `wikijs_list_pages(locale=None, path_prefix="", limit=100, offset=0)` discovers
+  page metadata and tags without fetching content. Omitted/empty locale means
+  all locales. Prefix matching is literal starts-with. Filtering precedes
+  pagination; limits are 1..500. Wiki.js has no list path/offset arguments, so
+  the server retrieves metadata and filters/slices locally. Output includes
+  `total` and `hasMore`; `total` counts pages visible to the API identity.
+- `wikijs_get_page_tags(page_id)` reads page tag objects without content.
+- `wikijs_list_tags(limit=100, offset=0)` reads the native `pages.tags` catalog,
+  sorted by tag and ID, with limits 1..500 and nonnegative offsets.
+- `wikijs_add_page_tags(page_id, tags)` adds without removing unrelated tags.
+- `wikijs_remove_page_tags(page_id, tags)` removes only the specified tags.
+- `wikijs_replace_page_tags(page_id, tags)` replaces the full set; `[]` clears it.
+- `wikijs_update_page(page_id, title=None, content=None, locale=None,
+  description=None, tags=None, is_published=None)` retains its shipped positional
+  arguments and adds optional metadata updates. Omitted or empty title/content/
+  locale keeps the stored value, allowing title-only calls with `content=""`.
+  `description=""` clears the description, `tags=[]` clears tags, and
+  `is_published=False` unpublishes. Unspecified fields, editor, scripts, privacy,
+  path, publication dates, and tags are preserved from the stored page.
+
+Tag changes use one read-modify-update of full stored page metadata. They are
+not atomic against concurrent human/API edits; avoid simultaneous edits of the
+same page. A failed update response is not retried automatically.
+
+### File-Like Tools
+
+- `wikijs_read_page(page_id, offset=1, limit=2000)` returns stored source as
+  `1: line` numbered text in `content`, with `pageId`, `path`, `title`, `locale`,
+  `contentType`, and `lastModified`. Offset is 1-based, limit is 1..2000;
+  past-EOF reads return empty text. Markdown is not rendered and HTML editors
+  return their original HTML, not a lossy Markdown conversion. Lines are clipped
+  at 2000 characters and numbered text at 64000 characters. `totalLines`,
+  `hasMore`, `nextOffset`, `lineTruncated`, and `truncated` describe the range.
+  Use `nextOffset` to continue; clipped line tails need `wikijs_get_page`.
+- `wikijs_edit_page(page_id, old_string, new_string, replace_all=False)` performs
+  literal, exact source replacement, including multiline text. Empty search,
+  missing matches, or multiple matches without `replace_all=True` are rejected.
+  Identical replacements do not mutate. Empty replacement deletes the matched
+  text, but edits resulting in empty/whitespace-only bodies are rejected before
+  mutation because Wiki.js v2 requires nonempty content. It reads once and uses the shared update
+  helper to preserve all unrelated metadata, scripts, editor, dates and tags.
+  The result reports `replacements`; mutations are not automatically retried.
+- `wikijs_grep_pages(pattern, locale=None, path_prefix="", limit=100,
+  case_sensitive=True)` searches stored source using Python regex per line,
+  returning only matching lines with `pageId`, `path`, `locale`, and `lineNumber`.
+  Invalid regex and limits outside 1..500 are rejected before network access.
+  Locale/prefix filtering happens before selecting the first 100 pages by ID;
+  at most 100 single-page content requests are made (reads may retry transport
+  failures). The metadata list itself has no upstream path/offset pagination.
+  Sources above 1000000 characters are skipped, returned lines are clipped at
+  2000 characters, and scanning stops after detecting a match beyond the result
+  limit. `truncated`, `resultLimitReached`, `lineTruncated`, `pagesScanned`,
+  `candidatePages`, and `skippedPageIds` identify partial results. Narrow locale/
+  prefix filters for larger wikis. Regex is not multiline across lines and has
+  no execution timeout: use trusted patterns. A clipped line may hide its match.
+
+These tools provide Read/Edit/Grep-style interaction without sending the entire
+page back to the model for editing. Wiki.js still transfers full source to the
+server for reads/grep and accepts full content for edits. Updates are not atomic
+against concurrent edits, so avoid simultaneous changes to the same page.
+
+`wikijs_search_pages` remains native, backend-dependent Wiki search. The built-in
+database backend searches title, description, and path, not body content; other
+backends may index content. Use `wikijs_grep_pages` for source-content matches.
+See the [v2 database search implementation](https://github.com/requarks/wiki/blob/v2.5.308/server/modules/search/db/engine.js)
+and [page update model](https://github.com/requarks/wiki/blob/v2.5.308/server/models/pages.js).
+
+Offline regression tests (no credentials, dotenv, server import, DB, or network):
+
+```bash
+python3 -I -m unittest discover -s tests -v
+```
+
+Activation: reload/reconnect this MCP server in the client after updating the
+source. `start-server.sh` executes this checkout's `src/wiki_mcp_server.py`, so
+a newly launched connection sees source edits. The flake's packaged
+`wikijs-mcp` instead executes an immutable source snapshot: rebuild/deploy that
+package first if that is the configured entrypoint. Reloading an unchanged
+package or merely refreshing tools on an existing process does not load edits.
+
+Public schema reference: [Wiki.js v2.5.308 page schema](https://github.com/requarks/wiki/blob/v2.5.308/server/graph/schemas/page.graphql).
+
+## 📊 MCP Tools
 
 ### 🏗️ **Hierarchical Documentation Tools**
 1. **`wikijs_create_repo_structure`** - Create complete repository documentation structure
@@ -400,4 +491,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ---
 
-**Ready to scale your documentation?** 🚀 Start with `wikijs_create_repo_structure` and build enterprise-grade documentation hierarchies! Use the Cursor global rules to ensure documentation-first development! 📚✨ 
+**Ready to scale your documentation?** 🚀 Start with `wikijs_create_repo_structure` and build enterprise-grade documentation hierarchies! Use the Cursor global rules to ensure documentation-first development! 📚✨
